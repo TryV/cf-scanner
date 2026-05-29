@@ -1,10 +1,6 @@
 package main
 
 import (
-	"context"
-	crand "crypto/rand"
-	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,18 +11,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
 	"slices"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
 	probing "github.com/prometheus-community/pro-bing"
-	"golang.org/x/net/http2"
-
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -116,6 +107,16 @@ type Conf struct {
 	Noises             NoiseConfig         `json:"Noises"`
 	DomainScan         DS                  `json:"DomainScan"`
 	DownloadTest       DownloadConfig      `json:"DownloadTest"`
+}
+
+type ResultRow struct {
+	Addr     string
+	Domain   string
+	MinRTT   time.Duration
+	Latency  int64
+	Jitter   float64
+	Download float64
+	Err      error
 }
 
 func main() {
@@ -210,9 +211,9 @@ func main() {
 	}
 
 	LOG := conf.LogErr
+	result := make(chan ResultRow, conf.Goroutines)
 	color.Green("【ＨＴＴＰ Ｓｃａｎ】\n")
 	if !conf.DomainScan.Enable {
-		res_ch := make(chan string, conf.Goroutines)
 		ip_ch := make(chan string, conf.Goroutines)
 
 		// scanners
@@ -284,8 +285,14 @@ func main() {
 						if conf.TLS.Utls.Enable && conf.TLS.Enable && !conf.HTTP3 {
 							uclient, utlsE := utlsTransporter(&conf, fingerprint, conf.TLS.SNI, addr, ifaceIP)
 							if utlsE != nil {
-								if LOG {
-									color.Red("%s", utlsE.Error())
+								result <- ResultRow{
+									Addr:     addr,
+									Domain:   "",
+									MinRTT:   minrtt,
+									Latency:  -1,
+									Jitter:   -1,
+									Download: -1,
+									Err:      utlsE,
 								}
 								continue
 							}
@@ -297,16 +304,23 @@ func main() {
 						e := time.Now()
 						latency := e.UnixMilli() - s.UnixMilli()
 						if http_err != nil {
-							if LOG {
-								color.Red("%s", http_err.Error())
+							result <- ResultRow{
+								Addr:     addr,
+								Domain:   "",
+								MinRTT:   minrtt,
+								Latency:  latency,
+								Jitter:   -1,
+								Download: -1,
+								Err:      http_err,
 							}
 							continue
 						}
 
 						if slices.Contains(conf.ResponseStatusCode, respone.StatusCode) && match(respone.Header, conf.ResponseHeader) {
 							// Calc jiiter
-							jitter_str := "Null"
-							download_test := "Null"
+							var jitter float64 = -1
+							var download_test float64
+							var err error
 							if conf.Jitter.Enable {
 								latencies := []float64{}
 								jammed := false
@@ -326,31 +340,38 @@ func main() {
 									}
 								}
 								if jammed {
-									if LOG {
-										color.Red("%s\t%s\t%d\tJAMMED\n", addr, minrtt, latency)
+									result <- ResultRow{
+										Addr:     addr,
+										Domain:   "",
+										MinRTT:   minrtt,
+										Latency:  latency,
+										Jitter:   jitter,
+										Download: -1,
+										Err:      errors.New("JAMMED"),
 									}
 									continue
 								}
-								jitter := Calc_jitter(latencies)
-								if jitter > conf.Jitter.MaxJitter {
-									color.Yellow("%s\t%s\t%d\t%f\n", addr, minrtt, latency, jitter)
-									continue
-								}
-								jitter_str = fmt.Sprintf("%f", jitter)
+								jitter = Calc_jitter(latencies)
 							}
 							if conf.DownloadTest.Enable {
-								download_test = downloadTest(client, &conf, addr, ifaceIP, fingerprint)
+								download_test, err = downloadTest(client, &conf, addr, ifaceIP, fingerprint)
 							}
-							rep := fmt.Sprintf("%s\t%s\t%d\t%s\t%s\n", addr, minrtt, latency, jitter_str, download_test)
-							color.Green("%s", rep)
-							if conf.CSV {
-								res_ch <- fmt.Sprintf("%s,%s,%d,%s,%s\n", addr, minrtt, latency, jitter_str, download_test)
-							} else {
-								res_ch <- rep
+
+							result <- ResultRow{
+								Addr:     addr,
+								MinRTT:   minrtt,
+								Latency:  latency,
+								Jitter:   jitter,
+								Download: download_test,
+								Err:      err,
 							}
 						} else {
-							if LOG {
-								color.Red("%s\t%s\tHTTP.StatusCode=%d\n", addr, minrtt, respone.StatusCode)
+							result <- ResultRow{
+								Addr:    addr,
+								MinRTT:  minrtt,
+								Latency: latency,
+								Jitter:  -1,
+								Err:     fmt.Errorf("HTTP.StatusCode=%d", respone.StatusCode),
 							}
 						}
 					}
@@ -359,48 +380,40 @@ func main() {
 		}
 
 		go func() {
-			file := resultFile(conf.CSV)
-			defer file.Close()
-
-			for {
-				v, ok := <-res_ch
-				if !ok {
-					break
+			if conf.RandomScan {
+				switch conf.IpVersion {
+				case 4:
+					rand.Shuffle(len(ips), func(i, j int) {
+						ips[i], ips[j] = ips[j], ips[i]
+					})
+					for _, ip := range ips {
+						ip_ch <- ip
+					}
+				case 6:
+					for {
+						ipv6, e := randomIPv6FromCIDR(strings.TrimSpace(ips[rand.Intn(len(ips))]))
+						if e != nil {
+							continue
+						}
+						ip_ch <- fmt.Sprintf("[%s]", ipv6.String())
+					}
 				}
-				file.Write([]byte(v))
-			}
-		}()
-
-		if conf.RandomScan {
-			switch conf.IpVersion {
-			case 4:
-				rand.Shuffle(len(ips), func(i, j int) {
-					ips[i], ips[j] = ips[j], ips[i]
-				})
+			} else {
+				if conf.IpVersion != 4 {
+					log.Fatalln("linear method is only available for ipv4")
+				}
 				for _, ip := range ips {
 					ip_ch <- ip
 				}
-			case 6:
-				for {
-					ipv6, e := randomIPv6FromCIDR(strings.TrimSpace(ips[rand.Intn(len(ips))]))
-					if e != nil {
-						continue
-					}
-					ip_ch <- fmt.Sprintf("[%s]", ipv6.String())
-				}
 			}
-		} else {
-			if conf.IpVersion != 4 {
-				log.Fatalln("linear method is only available for ipv4")
-			}
-			for _, ip := range ips {
-				ip_ch <- ip
-			}
-		}
+		}()
 
-		time.Sleep(time.Duration(conf.Maxlatency*int64(len(conf.Ports))) * time.Millisecond)
+		// time.Sleep(time.Duration(conf.Maxlatency*int64(len(conf.Ports))) * time.Millisecond)
 	} else {
 		// Domain Scan
+
+		var wg sync.WaitGroup
+
 		domainListFile, domainListFileErr := os.ReadFile(conf.DomainScan.DomainListPath)
 		if domainListFileErr != nil {
 			log.Fatalln(domainListFileErr)
@@ -413,9 +426,8 @@ func main() {
 			})
 		}
 
-		ch := make(chan string, conf.Goroutines)
 		for domainsChunk := range slices.Chunk(domains, len(domains)/conf.Goroutines) {
-			go func() {
+			wg.Go(func() {
 				for _, domain := range domainsChunk {
 					domain := strings.TrimSpace(domain)
 					ips, resolve_err := net.LookupIP(domain)
@@ -461,13 +473,13 @@ func main() {
 							minrtt = pinger.Statistics().AvgRtt
 						}
 						for _, port := range conf.Ports {
-							ip := fmt.Sprintf("%s:%d", ip, port)
+							addr := fmt.Sprintf("%s:%d", ip, port)
 							// generate http req
 							host := conf.Hostname
 							if conf.DomainScan.DomainAsHost {
 								host = domain
 							}
-							req := http.Request{Method: "GET", URL: &url.URL{Scheme: scheme, Host: ip, Path: conf.Path}, Host: host}
+							req := http.Request{Method: "GET", URL: &url.URL{Scheme: scheme, Host: addr, Path: conf.Path}, Host: host}
 							req.Header = maps.Clone(conf.Headers)
 							req.Header.Set("Host", host)
 							if conf.Padding {
@@ -491,10 +503,16 @@ func main() {
 
 							s := time.Now()
 							if conf.TLS.Utls.Enable && conf.TLS.Enable && !conf.HTTP3 {
-								uclient, utlsE := utlsTransporter(&conf, fingerprint, sni, ip, ifaceIP)
+								uclient, utlsE := utlsTransporter(&conf, fingerprint, sni, addr, ifaceIP)
 								if utlsE != nil {
-									if LOG {
-										color.Red("%s", utlsE.Error())
+									result <- ResultRow{
+										Addr:     addr,
+										Domain:   domain,
+										MinRTT:   minrtt,
+										Latency:  -1,
+										Jitter:   -1,
+										Download: -1,
+										Err:      utlsE,
 									}
 									continue
 								}
@@ -506,16 +524,22 @@ func main() {
 							e := time.Now()
 							latency := e.UnixMilli() - s.UnixMilli()
 							if http_err != nil {
-								if LOG {
-									color.Red("%s", http_err.Error())
+								result <- ResultRow{
+									Addr:    addr,
+									Domain:  domain,
+									MinRTT:  minrtt,
+									Latency: latency,
+									Jitter:  -1,
+									Err:     http_err,
 								}
 								continue
 							}
 
 							if slices.Contains(conf.ResponseStatusCode, respone.StatusCode) && match(respone.Header, conf.ResponseHeader) {
 								// Calc jiiter
-								jitter_str := "Null"
-								download_test := "Null"
+								var jitter float64 = -1
+								var download_test float64
+								var err error
 								if conf.Jitter.Enable {
 									latencies := []float64{}
 									jammed := false
@@ -535,57 +559,86 @@ func main() {
 										}
 									}
 									if jammed {
-										if LOG {
-											color.Red("%s(%s)\t%s\t%d\tJAMMED\n", domain, ip, minrtt, latency)
+										result <- ResultRow{
+											Addr:    addr,
+											Domain:  domain,
+											MinRTT:  minrtt,
+											Latency: latency,
+											Jitter:  jitter,
+											Err:     errors.New("JAMMED"),
 										}
 										continue
 									}
-									jitter := Calc_jitter(latencies)
-									if jitter > conf.Jitter.MaxJitter {
-										color.Yellow("%s(%s)\t%s\t%d\t%f\n", domain, ip, minrtt, latency, jitter)
-										continue
-									}
-									jitter_str = fmt.Sprintf("%f", jitter)
+									jitter = Calc_jitter(latencies)
 								}
 								if conf.DownloadTest.Enable {
-									download_test = downloadTest(client, &conf, ip, ifaceIP, fingerprint)
+									download_test, err = downloadTest(client, &conf, addr, ifaceIP, fingerprint)
 								}
-								rep := fmt.Sprintf("%s:\t%s\t%s\t%d\t%s\t%s\n", domain, ip, minrtt, latency, jitter_str, download_test)
-								color.Green("%s", rep)
-								if conf.CSV {
-									ch <- fmt.Sprintf("%s:%s,%s,%d,%s,%s\n", domain, ip, minrtt, latency, jitter_str, download_test)
-								} else {
-									ch <- rep
+								result <- ResultRow{
+									Addr:     addr,
+									Domain:   domain,
+									MinRTT:   minrtt,
+									Latency:  latency,
+									Jitter:   jitter,
+									Download: download_test,
+									Err:      err,
 								}
 							} else {
-								if LOG {
-									color.Red("%s(%s)\t%s\tHTTP.StatusCode=%d\n", domain, ip, minrtt, respone.StatusCode)
+								result <- ResultRow{
+									Addr:    addr,
+									Domain:  domain,
+									MinRTT:  minrtt,
+									Latency: latency,
+									Jitter:  -1,
+									Err:     fmt.Errorf("HTTP.StatusCode=%d", respone.StatusCode),
 								}
 							}
 						}
 					}
 				}
-			}()
+			})
 		}
 
-		file := resultFile(conf.CSV)
-		defer file.Close()
+		go func() {
+			wg.Wait()
+			close(result)
+		}()
+	}
 
-		deadgoroutines := 0
-		for {
-			if deadgoroutines == conf.Goroutines {
-				break
+	file := resultFile(conf.CSV)
+	defer file.Close()
+
+	for row := range result {
+		if row.Err == nil {
+			downloadSpeed := "0"
+			if row.Download > 0 {
+				downloadSpeed = fmt.Sprintf("%fMB/s", row.Download/1024/1024)
 			}
-			v, ok := <-ch
-			if !ok {
-				break
+
+			rep := fmt.Sprintf("%s\t%s\t%s\t%d\t%f\t%s\n", row.Addr, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
+
+			if row.Jitter > conf.Jitter.MaxJitter {
+				if LOG {
+					color.Yellow("%s", rep)
+				}
+			} else {
+				color.Green("%s", rep)
+
+				if conf.CSV {
+					fmt.Fprintf(file, "%s,%s,%s,%d,%f,%s\n", row.Addr, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
+				} else {
+					file.Write([]byte(rep))
+				}
 			}
-			if v == "end" {
-				deadgoroutines += 1
-				color.Green("end of goroutine")
-				continue
+
+		} else {
+			addr := row.Addr
+			if row.Domain != "" {
+				addr = fmt.Sprintf("%s(%s)", row.Domain, row.Addr)
 			}
-			file.Write([]byte(v))
+
+			color.Red("%s\t%s", addr, row.Err.Error())
 		}
+
 	}
 }

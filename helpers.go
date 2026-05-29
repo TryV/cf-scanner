@@ -92,7 +92,7 @@ func resultFile(csv bool) *os.File {
 			log.Fatalln(err)
 		}
 		if will_be_created {
-			csv_file.Write([]byte("ip:port,ping,latency,jitter,download\n"))
+			csv_file.Write([]byte("ip:port,domain,ping,latency,jitter,download\n"))
 		}
 		return csv_file
 	} else {
