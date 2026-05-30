@@ -16,6 +16,17 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+type ResultRow struct {
+	Addr     string
+	Port     int
+	Domain   string
+	MinRTT   time.Duration
+	Latency  int64
+	Jitter   float64
+	Download float64
+	Err      error
+}
+
 type IPChecker struct {
 	config *Conf
 }

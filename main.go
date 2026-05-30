@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/fatih/color"
 
@@ -102,17 +101,6 @@ type Conf struct {
 	Noises             NoiseConfig         `json:"Noises"`
 	DomainScan         DS                  `json:"DomainScan"`
 	DownloadTest       DownloadConfig      `json:"DownloadTest"`
-}
-
-type ResultRow struct {
-	Addr     string
-	Port     int
-	Domain   string
-	MinRTT   time.Duration
-	Latency  int64
-	Jitter   float64
-	Download float64
-	Err      error
 }
 
 func main() {
@@ -329,7 +317,7 @@ func main() {
 				downloadSpeed = fmt.Sprintf("%fMB/s", row.Download/1024/1024)
 			}
 
-			rep := fmt.Sprintf("%s\t%s\t%s\t%d\t%f\t%s\n", row.Addr, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
+			rep := fmt.Sprintf("%s:%d\t%s\t%s\t%d\t%f\t%s\n", row.Addr, row.Port, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
 
 			if row.Jitter > conf.Jitter.MaxJitter {
 				if LOG {
@@ -339,7 +327,7 @@ func main() {
 				color.Green("%s", rep)
 
 				if conf.CSV {
-					fmt.Fprintf(file, "%s,%s,%s,%d,%f,%s\n", row.Addr, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
+					fmt.Fprintf(file, "%s:%d,%s,%s,%d,%f,%s\n", row.Addr, row.Port, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
 				} else {
 					file.Write([]byte(rep))
 				}
@@ -348,7 +336,7 @@ func main() {
 		} else {
 			addr := row.Addr
 			if row.Domain != "" {
-				addr = fmt.Sprintf("%s(%s)", row.Domain, row.Addr)
+				addr = fmt.Sprintf("%s(%s:%d)", row.Domain, row.Addr, row.Port)
 			}
 
 			color.Red("%s\t%s", addr, row.Err.Error())
