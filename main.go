@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -74,6 +75,17 @@ type PingConfig struct {
 	Size       string  `json:"Size"`
 }
 
+type HttpServerConfig struct {
+	Enable               bool   `json:"Enable"`
+	PoolSize             int    `json:"PoolSize"`
+	HistorySize          int    `json:"HistorySize"`
+	HealthCheckSeconds   int    `json:"HealthCheckSeconds"`
+	HealthCheckBatchSize int    `json:"HealthCheckBatchSize"`
+	MaxFailures          int    `json:"MaxFailures"`
+	Port                 int    `json:"Port"`
+	Host                 string `json:"Host"`
+}
+
 type Conf struct {
 	LogErr             bool                `json:"LogErr"`
 	CSV                bool                `json:"CSV"`
@@ -101,6 +113,7 @@ type Conf struct {
 	Noises             NoiseConfig         `json:"Noises"`
 	DomainScan         DS                  `json:"DomainScan"`
 	DownloadTest       DownloadConfig      `json:"DownloadTest"`
+	HttpServer         HttpServerConfig    `json:"HttpServer"`
 }
 
 func main() {
@@ -194,12 +207,12 @@ func main() {
 		}
 	}
 
-	LOG := conf.LogErr
 	result := make(chan ResultRow, conf.Goroutines)
 	color.Green("【ＨＴＴＰ Ｓｃａｎ】\n")
 
 	ipChecker := NewIPChecker(&conf)
 	scanner := NewHTTPScanner(&conf, fingerprint, ifaceIP, ipChecker)
+	ctrl := NewScanController()
 
 	if !conf.DomainScan.Enable {
 		// IP-based scanning
@@ -210,6 +223,7 @@ func main() {
 			go func() {
 				for ip := range ipCh {
 					for _, port := range conf.Ports {
+						ctrl.Wait()
 						result <- scanner.scanTarget(ip, port, "", conf.Hostname, &conf.TLS.SNI, scheme)
 					}
 				}
@@ -284,6 +298,8 @@ func main() {
 						}
 
 						for _, port := range conf.Ports {
+							ctrl.Wait()
+
 							host := conf.Hostname
 							if conf.DomainScan.DomainAsHost {
 								host = domain
@@ -307,40 +323,70 @@ func main() {
 		}()
 	}
 
-	file := resultFile(conf.CSV)
-	defer file.Close()
+	if conf.HttpServer.Enable {
+		pool := NewPoolManager(&conf.HttpServer, ctrl)
+		hc := NewHealthChecker(pool, &conf.HttpServer, &conf, scanner.scanTarget, scheme)
+		go hc.Run()
 
-	for row := range result {
-		if row.Err == nil {
-			downloadSpeed := "0"
-			if row.Download > 0 {
-				downloadSpeed = fmt.Sprintf("%fMB/s", row.Download/1024/1024)
-			}
-
-			rep := fmt.Sprintf("%s:%d\t%s\t%s\t%d\t%f\t%s\n", row.Addr, row.Port, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
-
-			if row.Jitter > conf.Jitter.MaxJitter {
-				if LOG {
-					color.Yellow("%s", rep)
+		go func() {
+			addr := fmt.Sprintf("%s:%d", conf.HttpServer.Host, conf.HttpServer.Port)
+			log.Printf("[IPServer] Listening on http://%s\n", addr)
+			if err := http.ListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+					return
 				}
-			} else {
-				color.Green("%s", rep)
+				entries := pool.ActiveSnapshot()
 
-				if conf.CSV {
-					fmt.Fprintf(file, "%s:%d,%s,%s,%d,%f,%s\n", row.Addr, row.Port, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
-				} else {
-					file.Write([]byte(rep))
+				w.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(w).Encode(entries); err != nil {
+					log.Printf("[IPServer] encode error: %v\n", err)
 				}
+			})); err != nil {
+				log.Fatalf("[IPServer] Fatal: %v\n", err)
 			}
+		}()
 
-		} else {
-			addr := row.Addr
-			if row.Domain != "" {
-				addr = fmt.Sprintf("%s(%s:%d)", row.Domain, row.Addr, row.Port)
-			}
-
-			color.Red("%s\t%s", addr, row.Err.Error())
+		for row := range result {
+			pool.AddResult(row)
+			// keep your existing color logging here if desired
 		}
+	} else {
+		file := resultFile(conf.CSV)
+		defer file.Close()
 
+		for row := range result {
+			if row.Err == nil {
+				downloadSpeed := "0"
+				if row.Download > 0 {
+					downloadSpeed = fmt.Sprintf("%fMB/s", row.Download/1024/1024)
+				}
+
+				rep := fmt.Sprintf("%s:%d\t%s\t%s\t%d\t%f\t%s\n", row.Addr, row.Port, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
+
+				if row.Jitter > conf.Jitter.MaxJitter {
+					if conf.LogErr {
+						color.Yellow("%s", rep)
+					}
+				} else {
+					color.Green("%s", rep)
+
+					if conf.CSV {
+						fmt.Fprintf(file, "%s:%d,%s,%s,%d,%f,%s\n", row.Addr, row.Port, row.Domain, row.MinRTT, row.Latency, row.Jitter, downloadSpeed)
+					} else {
+						file.Write([]byte(rep))
+					}
+				}
+
+			} else {
+				addr := row.Addr
+				if row.Domain != "" {
+					addr = fmt.Sprintf("%s(%s:%d)", row.Domain, row.Addr, row.Port)
+				}
+
+				color.Red("%s\t%s", addr, row.Err.Error())
+			}
+		}
 	}
+
 }
