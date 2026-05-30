@@ -77,5 +77,15 @@
 		"SNI": "cp.cloudflare.com",
 		"TargetBytes": 5000000,
 		"Timeout": 5000
+	},
+	"HttpServer": {
+		"Enable": true,
+		"PoolSize": 32,
+		"HistorySize": 128,
+		"HealthCheckSeconds": 60,
+		"HealthCheckBatchSize": 32,
+		"MaxFailures": 3,
+		"Port": 7580,
+		"Host": "127.0.0.1"
 	}
 }
